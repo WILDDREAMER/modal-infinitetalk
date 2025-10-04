@@ -202,7 +202,7 @@ class Model:
                 # (model_root / "quant_models").mkdir(parents=True, exist_ok=True)
                 
                 # Download full Wan model for non-quantized operation with LoRA support
-                wan_model_dir = model_root / "Wan2.1-I2V-14B-480P"
+                wan_model_dir = model_root / "Wan2.1-I2V-14B-720P"
                 wan_model_dir.mkdir(exist_ok=True)
                 
                 # Essential Wan model files (config and encoders)
@@ -215,7 +215,7 @@ class Model:
                 
                 for filename, description in wan_base_files:
                     download_file(
-                        repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
+                        repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
                         filename=filename,
                         local_path=wan_model_dir / filename,
                         description=description
@@ -234,7 +234,7 @@ class Model:
                 
                 for filename, description in wan_diffusion_files:
                     download_file(
-                        repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
+                        repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
                         filename=filename,
                         local_path=wan_model_dir / filename,
                         description=description
@@ -252,7 +252,7 @@ class Model:
                         print(f"--- Downloading {description}... ---")
                         try:
                             snapshot_download(
-                                repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
+                                repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
                                 allow_patterns=[f"{subdir}/*"],
                                 local_dir=wan_model_dir
                             )
@@ -455,10 +455,10 @@ class Model:
         # Create args object that mimics command line arguments  
         args = SimpleNamespace(
             task="infinitetalk-14B",
-            size="infinitetalk-480",
+            size="infinitetalk-720",
             frame_num=chunk_frame_num,  # Chunk size for each iteration
             max_frame_num=max_frame_num,  # Total target length
-            ckpt_dir=str(model_root / "Wan2.1-I2V-14B-480P"),
+            ckpt_dir=str(model_root / "Wan2.1-I2V-14B-720P"),
             infinitetalk_dir=str(model_root / "InfiniteTalk" / "single" / "single" / "infinitetalk.safetensors"),
             quant_dir=None,  # Using non-quantized model for LoRA support
             wav2vec_dir=str(model_root / "chinese-wav2vec2-base"),
