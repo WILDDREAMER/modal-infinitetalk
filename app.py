@@ -2,11 +2,12 @@ import modal
 import os
 import time
 from pydantic import BaseModel
+from typing import Optional
 
 class GenerationRequest(BaseModel):
     image: str  # URL to the source image or video
     audio1: str # URL to the first audio file
-    prompt: str | None = None # (Optional) text prompt
+    prompt: Optional[str] = None # (Optional) text prompt
 
 # Use the new App class instead of Stub
 app = modal.App("infinitetalk-api")
@@ -114,12 +115,12 @@ class API:
 
 # --- GPU Model Class ---
 @app.cls(
-    gpu="L40S",
+    gpu="H200",
     enable_memory_snapshot=True, # new gpu snapshot feature: https://modal.com/blog/gpu-mem-snapshots
     experimental_options={"enable_gpu_snapshot": True},
     image=image,
     volumes={MODEL_DIR: model_volume, OUTPUT_DIR: output_volume},
-    scaledown_window=2, #scale down after 2 seconds. default is 60 seconds. for testing, just scale down for now
+    scaledown_window=600, # Keep containers warm for 10 minutes to avoid cold start penalty
     timeout=2700,  # 45 minutes timeout for large model downloads and initialization
 )
 class Model:
@@ -202,7 +203,7 @@ class Model:
                 # (model_root / "quant_models").mkdir(parents=True, exist_ok=True)
                 
                 # Download full Wan model for non-quantized operation with LoRA support
-                wan_model_dir = model_root / "Wan2.1-I2V-14B-720P"
+                wan_model_dir = model_root / "Wan2.1-I2V-14B-480P"
                 wan_model_dir.mkdir(exist_ok=True)
                 
                 # Essential Wan model files (config and encoders)
@@ -215,7 +216,7 @@ class Model:
                 
                 for filename, description in wan_base_files:
                     download_file(
-                        repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
+                        repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
                         filename=filename,
                         local_path=wan_model_dir / filename,
                         description=description
@@ -234,7 +235,7 @@ class Model:
                 
                 for filename, description in wan_diffusion_files:
                     download_file(
-                        repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
+                        repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
                         filename=filename,
                         local_path=wan_model_dir / filename,
                         description=description
@@ -252,7 +253,7 @@ class Model:
                         print(f"--- Downloading {description}... ---")
                         try:
                             snapshot_download(
-                                repo_id="Wan-AI/Wan2.1-I2V-14B-720P",
+                                repo_id="Wan-AI/Wan2.1-I2V-14B-480P",
                                 allow_patterns=[f"{subdir}/*"],
                                 local_dir=wan_model_dir
                             )
@@ -306,13 +307,30 @@ class Model:
                 #         description=description,
                 #     )
 
-                # Download FusioniX LoRA weights (will create FusionX_LoRa directory)
-                download_file(
-                    repo_id="vrgamedevgirl84/Wan14BT2VFusioniX",
-                    filename="FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
-                    local_path=model_root / "FusionX_LoRa" / "Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
-                    description="FusioniX LoRA weights",
-                )
+                # Download FusioniX LoRA weights
+                # Create the directory first
+                lora_dir = model_root / "FusionX_LoRa"
+                lora_dir.mkdir(parents=True, exist_ok=True)
+                lora_file = lora_dir / "Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+                
+                if not lora_file.exists():
+                    print("--- Downloading FusioniX LoRA weights... ---")
+                    try:
+                        # Download to the model root, then move to correct location
+                        downloaded_file = hf_hub_download(
+                            repo_id="vrgamedevgirl84/Wan14BT2VFusioniX",
+                            filename="FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
+                            local_dir=model_root,
+                        )
+                        print(f"--- FusioniX LoRA weights downloaded to {downloaded_file} ---")
+                        # Verify the file was downloaded correctly
+                        if not lora_file.exists():
+                            print(f"--- LoRA file expected at: {lora_file} ---")
+                            print(f"--- Downloaded file at: {downloaded_file} ---")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to download FusioniX LoRA weights: {e}")
+                else:
+                    print("--- FusioniX LoRA weights already present ---")
                 
                 print("--- All required files present. Committing to volume. ---")
                 model_volume.commit()
@@ -333,7 +351,7 @@ class Model:
             raise
 
     @modal.method()  
-    def _generate_video(self, image: bytes, audio1: bytes, prompt: str | None = None) -> str:
+    def _generate_video(self, image: bytes, audio1: bytes, prompt: Optional[str] = None) -> str:
         """
         Internal method to generate video from image/video input and save it to the output volume.
         Returns the filename of the generated video.
@@ -385,15 +403,71 @@ class Model:
             "prompt": prompt or "a person is talking", # Use provided prompt or a default
         }
 
-        print("--- Audio files prepared, using generate_infinitetalk.py directly ---")
+        print("--- Audio files prepared, checking for cached pipeline ---")
+        
+        # --- LAZY INITIALIZATION: Load models once, reuse for subsequent requests ---
+        import os
+        from pathlib import Path
+        
+        # Check if pipeline is already loaded (cached in GPU memory)
+        if not hasattr(self, 'pipeline') or self.pipeline is None:
+            print("--- First request in this container: Loading models into GPU memory ---")
+            t_load_start = time.time()
+            
+            import torch
+            from infinitetalk.wan.configs import WAN_CONFIGS
+            from infinitetalk.generate_infinitetalk import custom_init
+            import infinitetalk.wan as wan
+            
+            # Set environment variables for single GPU
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["LOCAL_RANK"] = "0"
+            
+            model_root = Path(MODEL_DIR)
+            
+            # Get configuration
+            cfg = WAN_CONFIGS["infinitetalk-14B"]
+            
+            # Initialize wav2vec audio encoder (runs on CPU)
+            print("--- Initializing wav2vec audio encoder... ---")
+            self.wav2vec_feature_extractor, self.audio_encoder = custom_init('cpu', str(model_root / "chinese-wav2vec2-base"))
+            
+            # Initialize InfiniteTalk pipeline - THIS LOADS MODELS INTO GPU
+            print("--- Creating InfiniteTalk pipeline (loading T5, CLIP, VAE, WanModel, LoRA)... ---")
+            self.pipeline = wan.InfiniteTalkPipeline(
+                config=cfg,
+                checkpoint_dir=str(model_root / "Wan2.1-I2V-14B-480P"),
+                quant_dir=None,
+                device_id=0,
+                rank=0,
+                t5_fsdp=False,
+                dit_fsdp=False,
+                use_usp=False,
+                t5_cpu=False,
+                lora_dir=[str(model_root / "FusionX_LoRa" / "Wan2.1_I2V_14B_FusionX_LoRA.safetensors")],
+                lora_scales=[1.0],
+                quant=None,
+                dit_path=None,
+                infinitetalk_dir=str(model_root / "InfiniteTalk" / "single" / "single" / "infinitetalk.safetensors")
+            )
+            
+            # Enable VRAM management
+            self.pipeline.vram_management = True
+            self.pipeline.enable_vram_management(num_persistent_param_in_dit=500000000)
+            
+            t_load_end = time.time()
+            print(f"--- ✅ Pipeline loaded and cached in GPU memory! ({t_load_end - t_load_start:.1f}s) ---")
+        else:
+            print("--- ✅ Using CACHED pipeline from GPU memory (no loading needed!) ---")
 
         import json
-        import os
         import shutil
-        from pathlib import Path
-        from infinitetalk.generate_infinitetalk import generate
+        from infinitetalk.generate_infinitetalk import audio_prepare_single, get_embedding
+        import torch
+        import soundfile as sf
         
-        # Create input JSON in the format expected by generate_infinitetalk.py
+        # Prepare input data description for logging
         input_json_data = {
             "prompt": input_data["prompt"],
             "cond_video": input_data["cond_video"],
@@ -403,11 +477,6 @@ class Model:
         # Add audio_type for multi-speaker
         if len(input_data["cond_audio"]) > 1:
             input_json_data["audio_type"] = "add"
-        
-        # Save input JSON to temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix=".json", delete=False) as tmp_json:
-            json.dump(input_json_data, tmp_json)
-            input_json_path = tmp_json.name
         
         # Calculate appropriate frame_num based on audio duration(s)
         import librosa
@@ -455,10 +524,10 @@ class Model:
         # Create args object that mimics command line arguments  
         args = SimpleNamespace(
             task="infinitetalk-14B",
-            size="infinitetalk-720",
+            size="infinitetalk-480",
             frame_num=chunk_frame_num,  # Chunk size for each iteration
             max_frame_num=max_frame_num,  # Total target length
-            ckpt_dir=str(model_root / "Wan2.1-I2V-14B-720P"),
+            ckpt_dir=str(model_root / "Wan2.1-I2V-14B-480P"),
             infinitetalk_dir=str(model_root / "InfiniteTalk" / "single" / "single" / "infinitetalk.safetensors"),
             quant_dir=None,  # Using non-quantized model for LoRA support
             wav2vec_dir=str(model_root / "chinese-wav2vec2-base"),
@@ -474,10 +543,9 @@ class Model:
             save_file=str(output_dir / output_filename),
             audio_save_dir=str(output_dir / "temp_audio"),
             base_seed=42,
-            input_json=input_json_path,
             motion_frame=25,
             mode=mode,
-            sample_steps=8,
+            sample_steps=6,  # Reduced from 8 to 6 for faster generation (~25% speedup)
             sample_shift=3.0,
             sample_text_guide_scale=1.0,
             sample_audio_guide_scale=6.0, # under 6 we lose some lip sync but as we go higher image gets unstable.
@@ -502,25 +570,53 @@ class Model:
         audio_save_dir = Path(args.audio_save_dir)
         audio_save_dir.mkdir(parents=True, exist_ok=True)
         
-        print("--- Generating video using original generate_infinitetalk.py logic ---")
-        print(f"--- Input JSON: {input_json_data} ---")
-        print(f"--- Audio save dir: {audio_save_dir} ---")
+        print("--- Generating video using CACHED pipeline ---")
+        print(f"--- Input data: {input_json_data} ---")
         
-        # Call the original generate function
-        generate(args)
+        # Prepare audio embedding using cached audio encoder
+        human_speech = audio_prepare_single(audio1_path)
+        audio_embedding = get_embedding(human_speech, self.wav2vec_feature_extractor, self.audio_encoder)
         
-        # The generate function saves the video with .mp4 extension
-        generated_file = f"{args.save_file}.mp4"
+        # Save audio embedding and processed audio
+        emb_path = audio_save_dir / '1.pt'
+        sum_audio = audio_save_dir / 'sum.wav'
+        sf.write(str(sum_audio), human_speech, 16000)
+        torch.save(audio_embedding, str(emb_path))
+        
+        # Prepare input for pipeline
+        input_clip = {
+            'prompt': input_data["prompt"],
+            'cond_video': image_path,
+            'cond_audio': {'person1': str(emb_path)},
+            'video_audio': str(sum_audio)
+        }
+        
+        # Generate video using CACHED pipeline
+        print("--- Calling cached pipeline.generate_infinitetalk() ---")
+        video = self.pipeline.generate_infinitetalk(
+            input_clip,
+            size_buckget=args.size,
+            motion_frame=args.motion_frame,
+            frame_num=chunk_frame_num,
+            shift=args.sample_shift,
+            sampling_steps=args.sample_steps,
+            text_guide_scale=args.sample_text_guide_scale,
+            audio_guide_scale=args.sample_audio_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model,
+            max_frames_num=max_frame_num,
+            color_correction_strength=args.color_correction_strength,
+            extra_args=args,
+        )
+        
+        # Post-process and save video
         final_output_path = output_dir / f"{output_filename}.mp4"
-        
-        # Move the generated file to our expected location
-        if os.path.exists(generated_file):
-            os.rename(generated_file, final_output_path)
+        from infinitetalk.wan.utils.multitalk_utils import save_video_ffmpeg
+        save_video_ffmpeg(video, str(final_output_path.with_suffix('')), [str(sum_audio)], high_quality_save=False)
         
         output_volume.commit()
         
-        # Clean up input JSON and temp audio directory
-        os.unlink(input_json_path)
+        # Clean up temp audio directory
         temp_audio_dir = output_dir / "temp_audio"
         if temp_audio_dir.exists():
             shutil.rmtree(temp_audio_dir)
